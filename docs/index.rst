@@ -68,6 +68,15 @@ Documentation
 
 .. toctree::
    :maxdepth: 1
+   :caption: Plugins
+
+   files/plugins/overview
+   files/plugins/available_plugins
+
+
+
+.. toctree::
+   :maxdepth: 1
    :caption: References
 
    files/references/api_reference
@@ -87,6 +96,7 @@ Documentation
    files/developer_guide/constraint_guide
    files/developer_guide/github_actions
    files/developer_guide/tips_and_tricks
+   files/developer_guide/implementing_plugins
 
 
 
