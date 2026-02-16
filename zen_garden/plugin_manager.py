@@ -6,14 +6,14 @@ and emits hooks to plugins, as well as the :class:`Hook` enum defining
 available extension points.
 """
 
-from importlib import import_module
-from typing import List
-from .utils import setup_logger
+import logging
 import pkgutil
 from enum import Enum
-import logging
+from importlib import import_module
+from typing import List
 
 from zen_garden.plugins.base_plugin import BasePlugin
+from .utils import setup_logger
 
 setup_logger()
 

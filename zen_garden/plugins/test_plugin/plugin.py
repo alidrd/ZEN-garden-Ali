@@ -4,11 +4,11 @@ Example plugin demonstrating the ZEN-garden plugin contract.
 This plugin serves as a reference implementation for developers creating
 new plugins.
 """
-from zen_garden.plugins.base_plugin import BasePlugin
-from zen_garden.plugin_manager import Hook
-from zen_garden.utils import setup_logger
-
 import logging
+
+from zen_garden.plugin_manager import Hook
+from zen_garden.plugins.base_plugin import BasePlugin
+from zen_garden.utils import setup_logger
 
 setup_logger()
 
