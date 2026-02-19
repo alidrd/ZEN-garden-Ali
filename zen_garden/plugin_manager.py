@@ -118,8 +118,8 @@ class PluginManager:
     def print_plugins(self):
         available_plugins = self.discover_plugins()
 
-        for p in available_plugins:
-            print(p)
+        for plugin in available_plugins:
+            print(plugin)
 
     def deregister_all(self):
         """
