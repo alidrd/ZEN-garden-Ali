@@ -98,10 +98,6 @@ class PluginManager:
                 plugin_module = import_module(module_path)
                 plugin = getattr(plugin_module, "Plugin", None)
                 plugin_instance = plugin(plugin_config)
-                try:
-                    plugin_instance.activate()
-                except Exception:
-                    logging.exception("Plugin.activate() failed for %s", module_path)
                 self._plugins.append(plugin_instance)
                 logging.info("Loaded plugin %s", getattr(plugin_instance, "name", module_path))
             except Exception:

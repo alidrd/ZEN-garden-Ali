@@ -67,19 +67,3 @@ class BasePlugin:
             loaded from the project configuration)
         """
         self.config = config or {}
-
-    def activate(self) -> None:
-        """
-        Activate the plugin.
-
-        This method is called once by the :class:`~zen_garden.core.plugin_manager.PluginManager`
-        after the plugin has been instantiated.
-
-        The default implementation is a no-op and returns ``None``.
-
-        Returns
-        -------
-        None
-
-        """
-        return None
