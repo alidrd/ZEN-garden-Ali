@@ -1,5 +1,5 @@
 """
-Plugin manager for ZEN-garden
+Plugin manager for ZEN-garden.
 
 This module provides the :class:`PluginManager` which discovers, loads,
 and emits hooks to plugins, as well as the :class:`Hook` enum defining
@@ -25,7 +25,7 @@ class Hook(Enum):
 
 class PluginManager:
     """
-    Plugin manager
+    Plugin manager.
 
     Responsibilities (minimal):
     - Load plugins listed in a config
@@ -82,7 +82,7 @@ class PluginManager:
         """
         Register plugins based on the provided list.
 
-        The config may be a list of identifiers
+        The config may be a list of identifiers.
         """
         if plugin_ids is None:
             logging.debug("No plugin config provided; skipping")
@@ -113,9 +113,15 @@ class PluginManager:
             plugin_hook(**kwargs)
 
     def get_plugins(self):
+        """
+        Returns a list of all registered plugins.
+        """
         return list(self._plugins)
 
     def print_plugins(self):
+        """
+        Print all discovered plugins.
+        """
         available_plugins = self.discover_plugins()
 
         for plugin in available_plugins:
