@@ -55,13 +55,13 @@ class PluginManager:
         # First, try the base package itself and discover top-level plugin
         # modules/packages directly under it.
         try:
-            base_pkg = import_module(self.base_package)
+            base_package = import_module(self.base_package)
         except ImportError:
             logging.exception("Plugin package %s not found", self.base_package)
             return discovered
 
         # Iterate over modules/packages in the base package path
-        for finder, name, ispkg in pkgutil.iter_modules(base_pkg.__path__):
+        for finder, name, ispkg in pkgutil.iter_modules(base_package.__path__):
             if name.startswith("_"):
                 continue
 
@@ -90,22 +90,22 @@ class PluginManager:
 
         for plugin_id, plugin_config in plugin_ids.items():
             plugin_config = plugin_config["config"]
-            mod_path = f"{self.base_package}.{plugin_id}"
-            if not mod_path:
+            module_path = f"{self.base_package}.{plugin_id}"
+            if not module_path:
                 logging.exception("Could not resolve plugin identifier: %s", plugin_id)
                 continue
             try:
-                mod = import_module(mod_path)
-                cls = getattr(mod, "Plugin", None)
-                inst = cls(plugin_config)
+                plugin_module = import_module(module_path)
+                plugin = getattr(plugin_module, "Plugin", None)
+                plugin_instance = plugin(plugin_config)
                 try:
-                    inst.activate()
+                    plugin_instance.activate()
                 except Exception:
-                    logging.exception("Plugin.activate() failed for %s", mod_path)
-                self._plugins.append(inst)
-                logging.info("Loaded plugin %s", getattr(inst, "name", mod_path))
+                    logging.exception("Plugin.activate() failed for %s", module_path)
+                self._plugins.append(plugin_instance)
+                logging.info("Loaded plugin %s", getattr(plugin_instance, "name", module_path))
             except Exception:
-                logging.exception("Failed loading plugin %s", mod_path)
+                logging.exception("Failed loading plugin %s", module_path)
 
     def emit(self, hook: Hook, **kwargs):
         """
