@@ -108,10 +108,9 @@ class PluginManager:
         Call hook on all plugins. One can pass additional arguments via kwargs.
         """
         hook_name = hook.value
-        for p in list(self._plugins):
-            fn = getattr(p, hook_name, None)
-            if callable(fn):
-                fn(**kwargs)
+        for plugin_instance in list(self._plugins):
+            plugin_hook = getattr(plugin_instance, hook_name, None)
+            plugin_hook(**kwargs)
 
     def get_plugins(self):
         return list(self._plugins)
