@@ -16,6 +16,7 @@ import linopy as lp
 import numpy as np
 import pandas as pd
 
+from zen_garden.events import Events, Event
 from zen_garden.model.component import Constraint, IndexSet, Parameter, Variable
 from zen_garden.model.element import Element
 from zen_garden.model.energy_system import EnergySystem
@@ -539,6 +540,7 @@ class OptimizationSetup(object):
 
     def construct_optimization_problem(self):
         """Constructs the optimization problem."""
+        Events.trigger(Event.before_optimization_construction)
         self.plugin_manager.emit(Hook.BEFORE_OPTIMIZATION_CONSTRUCTION,
                                  optimization_setup=self)
 
@@ -556,6 +558,7 @@ class OptimizationSetup(object):
         # define and construct components of self.model
         Element.construct_model_components(self)
 
+        Events.trigger(Event.after_optimization_construction)
         self.plugin_manager.emit(Hook.AFTER_OPTIMIZATION_CONSTRUCTION,
                                  optimization_setup=self,
                                  model_instance=self.model)
