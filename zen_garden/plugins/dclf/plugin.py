@@ -10,6 +10,7 @@ transport model. After each optimization construction, this plugin:
 """
 
 import logging
+import numpy as np
 from zen_garden.events import Events, Event
 from zen_garden.model.technology.transport_technology import TransportTechnology
 
@@ -25,7 +26,6 @@ def after_optimization_construction(optimization_setup, **kwargs):
     # STEP 2: Read impedance from power_lines and compute susceptance
     # ------------------------------------------------------------------ #
 
-    # Find the power_lines transport technology object
     transport_techs = optimization_setup.get_all_elements(TransportTechnology)
     power_lines = next(
         (t for t in transport_techs if t.name == "power_lines"), None
@@ -35,8 +35,6 @@ def after_optimization_construction(optimization_setup, **kwargs):
         logging.warning("DCLF plugin: no 'power_lines' technology found — skipping.")
         return
 
-    # Read impedance.csv using ZEN-garden's own data machinery
-    # (handles unit conversion, defaults, index alignment automatically)
     impedance = power_lines.data_input.extract_input_data(
         file_name="impedance",
         index_sets=["set_edges"],
@@ -45,11 +43,44 @@ def after_optimization_construction(optimization_setup, **kwargs):
     susceptance = 1.0 / impedance
 
     # ------------------------------------------------------------------ #
-    # STEP 2 TEST: print impedance and susceptance to verify
+    # STEP 3: Inspect index sets and flow_transport variable
+    # ------------------------------------------------------------------ #
+
+    # Key sets we need for building DCLF constraints
+    nodes      = list(optimization_setup.sets["set_nodes"])
+    edges      = list(optimization_setup.sets["set_edges"])
+    time_steps = list(optimization_setup.sets["set_time_steps_operation"])
+
+    # Edge → (from_node, to_node) mapping, stored on energy_system
+    nodes_on_edges = optimization_setup.energy_system.set_nodes_on_edges
+
+    # The existing flow variable for transport technologies
+    flow_transport = optimization_setup.model.variables["flow_transport"]
+
+    # ------------------------------------------------------------------ #
+    # STEP 4: Add voltage angle variable theta[node, time_step]
+    # ------------------------------------------------------------------ #
+    # theta is unbounded (radians); the reference bus pin is added later.
+    # We mirror ZEN-garden's dim naming convention so linopy aligns indices
+    # consistently with the rest of the model.
+
+    model = optimization_setup.model
+    theta = model.add_variables(
+        lower=-np.inf,
+        upper=np.inf,
+        coords=[nodes, time_steps],
+        dims=["set_nodes", "set_time_steps_operation"],
+        name="theta",
+    )
+
+    # ------------------------------------------------------------------ #
+    # STEP 4 TEST: verify theta ended up in the model with correct shape
     # ------------------------------------------------------------------ #
     print("\n" + "=" * 60)
-    print("DCLF plugin — Step 2: impedance & susceptance")
+    print("DCLF plugin — Step 4: theta variable")
     print("=" * 60)
-    print(f"\nimpedance (from CSV):\n{impedance}")
-    print(f"\nsusceptance (1/impedance):\n{susceptance}")
+    print(f"theta dims   : {theta.dims}")
+    print(f"theta coords : {dict(theta.coords)}")
+    print(f"theta shape  : {theta.shape}")
+    print(f"'theta' in model.variables: {'theta' in model.variables}")
     print("=" * 60 + "\n")
