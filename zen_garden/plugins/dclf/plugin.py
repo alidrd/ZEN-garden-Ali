@@ -58,6 +58,22 @@ def after_optimization_construction(optimization_setup, **kwargs):
     flow_transport = optimization_setup.model.variables["flow_transport"]
 
     # ------------------------------------------------------------------ #
+    # STEP 3 TEST: print sets and variable info
+    # ------------------------------------------------------------------ #
+    print("\n" + "=" * 60)
+    print("DCLF plugin — Step 3: index sets & flow_transport")
+    print("=" * 60)
+    print(f"\nnodes      : {nodes}")
+    print(f"edges      : {edges}")
+    print(f"time_steps : {time_steps}")
+    print(f"\nnodes_on_edges (edge → (from, to)):")
+    for edge, (frm, to) in nodes_on_edges.items():
+        print(f"  {edge:10s} → from={frm}, to={to}")
+    print(f"\nflow_transport dims   : {flow_transport.dims}")
+    print(f"flow_transport coords : {dict(flow_transport.coords)}")
+    print("=" * 60 + "\n")
+
+    # ------------------------------------------------------------------ #
     # STEP 4: Add voltage angle variable theta[node, time_step]
     # ------------------------------------------------------------------ #
     # theta is unbounded (radians); the reference bus pin is added later.
@@ -84,3 +100,96 @@ def after_optimization_construction(optimization_setup, **kwargs):
     print(f"theta shape  : {theta.shape}")
     print(f"'theta' in model.variables: {'theta' in model.variables}")
     print("=" * 60 + "\n")
+
+    # ------------------------------------------------------------------ #
+    # STEP 4b: Allow bidirectional flow on power_lines
+    # ------------------------------------------------------------------ #
+    # flow_transport is bounded below by capacity.lower = 0, making it
+    # unidirectional. DCLF requires signed flow: direction is determined
+    # by angle differences, which can be positive OR negative.
+    # Fix: set lower bound to -upper_bound for power_lines entries.
+
+    ft = optimization_setup.model.variables["flow_transport"]
+    pl_mask = ft.labels.loc["power_lines"].data != -1   # valid (non-padding) entries
+    ft.lower.loc["power_lines"].data[pl_mask] = -ft.upper.loc["power_lines"].data[pl_mask]
+
+    # ------------------------------------------------------------------ #
+    # STEP 5: Add DCLF flow equality constraints
+    #   flow_transport["power_lines", edge, t] == B_edge * (theta_from - theta_to)
+    # ------------------------------------------------------------------ #
+    # flow_transport dims: [set_transport_technologies, set_edges, set_time_steps_operation]
+    # theta dims:          [set_nodes, set_time_steps_operation]
+
+    n_constraints = 0
+    first_edge_name = None
+    first_lhs = None
+    last_edge_name = None
+    last_lhs = None
+
+    for edge in edges:
+        from_node, to_node = nodes_on_edges[edge]
+        b = float(susceptance.loc[edge])
+
+        # Slice: flow on power_lines for this edge, all time steps
+        flow_edge = flow_transport.loc["power_lines", edge, :]
+
+        # Angle difference: theta_from(t) - theta_to(t), all time steps
+        theta_diff = (
+            theta.sel(set_nodes=from_node)
+            - theta.sel(set_nodes=to_node)
+        )
+
+        # Equality: flow == B * (theta_from - theta_to)
+        lhs = flow_edge - b * theta_diff
+        model.add_constraints(lhs == 0, name=f"dclf_flow_{edge}")
+        n_constraints += len(time_steps)
+
+        if first_edge_name is None:
+            first_edge_name = edge
+            first_lhs = lhs
+        last_edge_name = edge
+        last_lhs = lhs
+
+    # ------------------------------------------------------------------ #
+    # STEP 5 TEST: verify constraints entered the model correctly
+    # ------------------------------------------------------------------ #
+    print("\n" + "=" * 60)
+    print("DCLF plugin — Step 5: DCLF flow equality constraints")
+    print("=" * 60)
+    print(f"Constraints added : {n_constraints}  "
+          f"({len(edges)} edges × {len(time_steps)} time steps)")
+    print(f"\nConstraint names in model:")
+    for name in model.constraints:
+        if name.startswith("dclf_"):
+            print(f"  {name}")
+    if first_lhs is not None:
+        print(f"\nFirst constraint — edge '{first_edge_name}' (t=0):")
+        print(f"  {first_lhs.isel(set_time_steps_operation=0)}")
+    if last_lhs is not None and last_edge_name != first_edge_name:
+        print(f"\nLast constraint  — edge '{last_edge_name}' (t=0):")
+        print(f"  {last_lhs.isel(set_time_steps_operation=0)}")
+    print("=" * 60 + "\n")
+
+    # ------------------------------------------------------------------ #
+    # STEP 6: Reference bus constraint — theta_slack = 0 at all time steps
+    # ------------------------------------------------------------------ #
+    # Without this, angles are only determined up to a constant offset
+    # (the LP is under-determined). Pinning one node fixes the gauge.
+    # The slack node is read from the plugin config (default: "CH").
+
+    slack_node = config.get("slack_node", "CH")
+    theta_slack = theta.sel(set_nodes=slack_node)
+    model.add_constraints(theta_slack == 0, name="dclf_ref_bus")
+
+    # ------------------------------------------------------------------ #
+    # STEP 6 TEST: confirm reference bus constraint is in the model
+    # ------------------------------------------------------------------ #
+    print("\n" + "=" * 60)
+    print("DCLF plugin — Step 6: reference bus constraint")
+    print("=" * 60)
+    print(f"Slack node  : '{slack_node}'")
+    print(f"'dclf_ref_bus' in model.constraints: {'dclf_ref_bus' in model.constraints}")
+    print(f"\nExpression (t=0):")
+    print(f"  {theta_slack.isel(set_time_steps_operation=0)}")
+    print("=" * 60 + "\n")
+    logging.info("DCLF plugin: all constraints added successfully.")
