@@ -57,7 +57,9 @@
     "unit": "1"
   },
   "input_carrier": {
-    "default_value": []
+    "default_value": [
+      "fuel"
+    ]
   },
   "output_carrier": {
     "default_value": [
@@ -65,7 +67,7 @@
     ]
   },
   "conversion_factor": {
-    "": {
+    "fuel": {
       "default_value": 1.0,
       "unit": "GWh/GWh"
     }
