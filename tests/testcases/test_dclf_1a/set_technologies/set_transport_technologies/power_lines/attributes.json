@@ -71,5 +71,9 @@
   "capacity_addition_unbounded": {
     "default_value": 0.0,
     "unit": "GW"
+  },
+  "impedance": {
+    "default_value": 0.99,
+    "unit": "1"
   }
 }
