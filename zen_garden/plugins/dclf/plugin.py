@@ -115,40 +115,48 @@ def after_optimization_construction(optimization_setup, **kwargs):
 
     # ------------------------------------------------------------------ #
     # STEP 5: Add DCLF flow equality constraints
-    #   flow_transport["power_lines", edge, t] == B_edge * (theta_from - theta_to)
     # ------------------------------------------------------------------ #
-    # flow_transport dims: [set_transport_technologies, set_edges, set_time_steps_operation]
-    # theta dims:          [set_nodes, set_time_steps_operation]
+    # ZEN-garden models each physical line as TWO directed edges
+    # (e.g. AT-CH and CH-AT). Applying DCLF to both would force
+    # flow_CH-AT = -flow_AT-CH, and ZEN-garden's energy balance would
+    # count BOTH contributions, doubling the apparent power delivery.
+    #
+    # Fix: apply DCLF only to canonical edges (from_node < to_node),
+    # and pin reverse edges to zero so they don't contribute to the
+    # energy balance at all.
 
-    n_constraints = 0
-    first_edge_name = None
-    first_lhs = None
-    last_edge_name = None
-    last_lhs = None
+    canonical_edges = []   # one per physical line — DCLF applied here
+    reverse_edges   = []   # paired duals — pinned to zero
 
     for edge in edges:
-        from_node, to_node = nodes_on_edges[edge]
+        fn, tn = nodes_on_edges[edge]
+        if fn < tn:
+            canonical_edges.append(edge)
+        else:
+            reverse_edges.append(edge)
+
+    # DCLF equality on canonical edges
+    first_edge_name = last_edge_name = None
+    first_lhs       = last_lhs       = None
+
+    for edge in canonical_edges:
+        fn, tn = nodes_on_edges[edge]
         b = float(susceptance.loc[edge])
 
-        # Slice: flow on power_lines for this edge, all time steps
-        flow_edge = flow_transport.loc["power_lines", edge, :]
+        flow_edge  = flow_transport.loc["power_lines", edge, :]
+        theta_diff = theta.sel(set_nodes=fn) - theta.sel(set_nodes=tn)
 
-        # Angle difference: theta_from(t) - theta_to(t), all time steps
-        theta_diff = (
-            theta.sel(set_nodes=from_node)
-            - theta.sel(set_nodes=to_node)
-        )
-
-        # Equality: flow == B * (theta_from - theta_to)
         lhs = flow_edge - b * theta_diff
         model.add_constraints(lhs == 0, name=f"dclf_flow_{edge}")
-        n_constraints += len(time_steps)
 
         if first_edge_name is None:
-            first_edge_name = edge
-            first_lhs = lhs
-        last_edge_name = edge
-        last_lhs = lhs
+            first_edge_name, first_lhs = edge, lhs
+        last_edge_name, last_lhs = edge, lhs
+
+    # Pin reverse edges to zero — prevents double-counting in energy balance
+    for edge in reverse_edges:
+        flow_rev = flow_transport.loc["power_lines", edge, :]
+        model.add_constraints(flow_rev == 0, name=f"dclf_zero_{edge}")
 
     # ------------------------------------------------------------------ #
     # STEP 5 TEST: verify constraints entered the model correctly
@@ -156,17 +164,17 @@ def after_optimization_construction(optimization_setup, **kwargs):
     print("\n" + "=" * 60)
     print("DCLF plugin — Step 5: DCLF flow equality constraints")
     print("=" * 60)
-    print(f"Constraints added : {n_constraints}  "
-          f"({len(edges)} edges × {len(time_steps)} time steps)")
+    print(f"Canonical edges (DCLF applied) : {canonical_edges}")
+    print(f"Reverse edges   (pinned to 0)  : {reverse_edges}")
     print(f"\nConstraint names in model:")
     for name in model.constraints:
         if name.startswith("dclf_"):
             print(f"  {name}")
     if first_lhs is not None:
-        print(f"\nFirst constraint — edge '{first_edge_name}' (t=0):")
+        print(f"\nFirst DCLF constraint — edge '{first_edge_name}' (t=0):")
         print(f"  {first_lhs.isel(set_time_steps_operation=0)}")
     if last_lhs is not None and last_edge_name != first_edge_name:
-        print(f"\nLast constraint  — edge '{last_edge_name}' (t=0):")
+        print(f"\nLast DCLF constraint  — edge '{last_edge_name}' (t=0):")
         print(f"  {last_lhs.isel(set_time_steps_operation=0)}")
     print("=" * 60 + "\n")
 
