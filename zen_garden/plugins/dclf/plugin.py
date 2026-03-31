@@ -11,6 +11,7 @@ transport model. After each optimization construction, this plugin:
 
 import logging
 import numpy as np
+import xarray as xr
 from zen_garden.events import Events, Event
 from zen_garden.model.technology.transport_technology import TransportTechnology
 
@@ -152,6 +153,44 @@ def after_optimization_construction(optimization_setup, **kwargs):
         if first_edge_name is None:
             first_edge_name, first_lhs = edge, lhs
         last_edge_name, last_lhs = edge, lhs
+
+    # ------------------------------------------------------------------ #
+    # STEP 5b: Reverse capacity constraint for canonical edges
+    # ------------------------------------------------------------------ #
+    # ZEN-garden's existing capacity constraint is one-sided:
+    #   max_load * capacity - flow ≥ 0   →   flow ≤ capacity
+    # This was fine when flow ≥ 0 always. With DCLF, canonical edges carry
+    # signed flow, so we also need the symmetric lower bound:
+    #   flow + max_load * capacity ≥ 0   →   flow ≥ -capacity
+    # Without this, a negative flow of -0.6 GW passes the one-sided check
+    # even if capacity_limit = 0.5 GW.
+    #
+    # Note: max_load is assumed 1.0 for power lines (standard assumption).
+    # If max_load varies per edge/time, replace `capacity_var` with
+    # `max_load * capacity_var` using the same time-step mapping below.
+
+    # Map each operational time step to its investment year
+    # (capacity is a yearly variable, flow is an operational variable)
+    ts_obj = optimization_setup.energy_system.time_steps
+    op_times_coord = flow_transport.coords["set_time_steps_operation"]
+    time_step_year = xr.DataArray(
+        [ts_obj.convert_time_step_operation2year(int(t)) for t in op_times_coord.data],
+        coords=[op_times_coord],
+    )
+
+    capacity_var = optimization_setup.model.variables["capacity"]
+
+    for edge in canonical_edges:
+        flow_edge = flow_transport.loc["power_lines", edge, :]
+
+        # Select capacity for this edge at each operational time step
+        # (indexed via year mapping — mirrors ZEN-garden's term_capacity logic)
+        cap_edge = capacity_var.loc["power_lines", "power", edge, time_step_year]
+
+        model.add_constraints(
+            flow_edge + cap_edge >= 0,
+            name=f"dclf_rev_cap_{edge}",
+        )
 
     # Pin reverse edges to zero via bounds — prevents double-counting in energy balance.
     # Using bounds (lb = ub = 0) is strictly better than adding equality constraints:

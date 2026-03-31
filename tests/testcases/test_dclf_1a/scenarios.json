@@ -1,0 +1,15 @@
+{
+  "base": {},
+
+  "high_limits": {
+    "power_lines": {
+      "capacity_limit": {"default_op": 3.0}
+    }
+  },
+
+  "tight_limits": {
+    "power_lines": {
+      "capacity_limit": {"file": "capacity_limit_tight"}
+    }
+  }
+}
