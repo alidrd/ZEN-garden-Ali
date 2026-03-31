@@ -153,10 +153,15 @@ def after_optimization_construction(optimization_setup, **kwargs):
             first_edge_name, first_lhs = edge, lhs
         last_edge_name, last_lhs = edge, lhs
 
-    # Pin reverse edges to zero — prevents double-counting in energy balance
+    # Pin reverse edges to zero via bounds — prevents double-counting in energy balance.
+    # Using bounds (lb = ub = 0) is strictly better than adding equality constraints:
+    # the solver eliminates zero-bounded variables during presolve before the LP is
+    # even handed to the simplex/interior-point method, so they add no rows to the
+    # LP matrix and no computational cost at all.
     for edge in reverse_edges:
-        flow_rev = flow_transport.loc["power_lines", edge, :]
-        model.add_constraints(flow_rev == 0, name=f"dclf_zero_{edge}")
+        mask = ft.labels.loc["power_lines", edge].data != -1
+        ft.lower.loc["power_lines", edge].data[mask] = 0.0
+        ft.upper.loc["power_lines", edge].data[mask] = 0.0
 
     # ------------------------------------------------------------------ #
     # STEP 5 TEST: verify constraints entered the model correctly
@@ -165,7 +170,7 @@ def after_optimization_construction(optimization_setup, **kwargs):
     print("DCLF plugin — Step 5: DCLF flow equality constraints")
     print("=" * 60)
     print(f"Canonical edges (DCLF applied) : {canonical_edges}")
-    print(f"Reverse edges   (pinned to 0)  : {reverse_edges}")
+    print(f"Reverse edges   (bounds→0, presolve-eliminated) : {reverse_edges}")
     print(f"\nConstraint names in model:")
     for name in model.constraints:
         if name.startswith("dclf_"):
