@@ -1,0 +1,7 @@
+edge,capacity_limit
+AT-CH,1
+AT-DE,1
+CH-AT,1
+CH-DE,0.5
+DE-AT,1
+DE-CH,0.5
