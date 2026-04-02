@@ -121,6 +121,8 @@ def _add_constraint(i, cstr, model, duration, nodes_on_edges):
     for j, term in enumerate(cstr["terms"]):
         expr = _build_term(j, term, model, duration, nodes_on_edges)
         total_expr = expr if total_expr is None else (total_expr + expr)
+    
+    print(f"\n  Created expression is: {total_expr}")
 
     # ── PRINT 3: confirm expression was built ────────────────────────────────
     print(f"  Total expression built → adding to model as 'target_constraint_{i}'")
