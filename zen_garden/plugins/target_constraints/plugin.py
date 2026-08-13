@@ -15,8 +15,36 @@ Dimension filter spec for each dim:
   {                 → special edge-node-role filter (for set_edges only)
     "filter_type": "edge_node_role",
     "node": "<node_name>",
-    "role": "source" | "destination" | "any"
+    "role": "net_export" | "net_import" | "source" | "destination" | "any"
   }
+  {                 → net flow over an explicit list of corridors
+    "filter_type": "edge_net",
+    "edges": ["DE-CH", ...]        // each minus its reverse edge
+  }
+
+Directed vs net flows
+---------------------
+ZEN-garden represents every corridor as two directed edges with non-negative
+flows, and only their difference reaches the nodal energy balance. On a corridor
+with no losses and no variable opex the pair is degenerate: the solver may return
+a large flow in both directions whose difference is correct. Any constraint that
+sums directed flows therefore counts circulating volume that does not physically
+exist, and "exports from DE >= X" can be satisfied by flow that immediately
+returns.
+
+The netting roles remove this by construction, because circulation adds the same
+amount to both directions of a corridor and cancels in the difference:
+
+  net_export = Σ(edges where node is source) − Σ(edges where node is destination)
+  net_import = the negative of that
+
+The directional roles ("source", "destination", "any") are kept for gross
+throughput targets and warn when used on flow variables, since they are only
+meaningful when the model cannot circulate. Note that "any" double-counts every
+corridor even without circulation, as it selects both directions.
+
+Net flows are measured at the sending end; on a lossy corridor the importing node
+receives slightly less.
 
 Example config entry:
   {
@@ -144,10 +172,76 @@ def _add_constraint(i, cstr, model, duration, nodes_on_edges):
     print(f"  ✓ '{name}' registered in model")
 
 
+def _reverse_edge_map(nodes_on_edges):
+    """Map every edge to the edge running the other way, where one exists."""
+    edge_by_pair = {nodes_on_edges[e]: e for e in nodes_on_edges}
+    return {
+        e: edge_by_pair.get((v, u)) for e, (u, v) in nodes_on_edges.items()
+    }
+
+
+def _resolve_edge_role(spec, all_coords, nodes_on_edges, var_name):
+    """Resolve an edge filter into (positive edges, negative edges).
+
+    Netting roles return a non-empty negative list, whose flows are subtracted
+    so that circulating volume cancels. Directional roles return an empty one.
+    """
+    filter_type = spec.get("filter_type")
+
+    if filter_type == "edge_net":
+        requested = spec["edges"]
+        missing = [e for e in requested if e not in all_coords]
+        if missing:
+            raise ValueError(
+                f"[target_constraints] Edges {missing} not found in '{var_name}'. "
+                f"Available: {all_coords}"
+            )
+        reverse = _reverse_edge_map(nodes_on_edges)
+        positive = list(requested)
+        negative = [reverse[e] for e in requested if reverse.get(e) in all_coords]
+        orphans = [e for e in requested if reverse.get(e) not in all_coords]
+        if orphans:
+            logging.warning(
+                f"[target_constraints] Edges {orphans} have no reverse edge; their "
+                f"flow is counted gross, not net."
+            )
+        return positive, negative
+
+    node = spec["node"]
+    role = spec["role"]
+    outgoing = [e for e in all_coords if nodes_on_edges[e][0] == node]
+    incoming = [e for e in all_coords if nodes_on_edges[e][1] == node]
+
+    if role == "net_export":
+        return outgoing, incoming
+    if role == "net_import":
+        return incoming, outgoing
+    if role in ("source", "destination", "any"):
+        if var_name.startswith("flow_"):
+            logging.warning(
+                f"[target_constraints] Role '{role}' sums directed flows of "
+                f"'{var_name}'. On a corridor with no losses and no variable opex "
+                f"the two directions are degenerate, so this total can include "
+                f"circulating volume that never physically moves. Use "
+                f"'net_export'/'net_import' unless a gross throughput target is "
+                f"intended."
+            )
+        if role == "source":
+            return outgoing, []
+        if role == "destination":
+            return incoming, []
+        return [e for e in all_coords if node in nodes_on_edges[e]], []
+
+    raise ValueError(f"[target_constraints] Unknown edge role '{role}'")
+
+
 def _build_term(j, term, model, duration, nodes_on_edges):
     """
     Build a scalar linopy LinearExpression for one term:
       Σ_{filtered dims} variable * duration_weight
+
+    Edge filters may be signed, in which case the term is the difference of two
+    such sums (see the module docstring on directed vs net flows).
     """
     var_name = term["variable"]
     dims_cfg = term["dimensions"]
@@ -161,6 +255,9 @@ def _build_term(j, term, model, duration, nodes_on_edges):
     # ── STEP A: resolve valid coordinate list for every dim ───────────────────
     print(f"    [STEP A] Resolving dimension filters:")
     filtered_coords = {}
+    edge_dim = None
+    edge_positive, edge_negative = None, []
+
     for dim, spec in dims_cfg.items():
         all_coords = list(var.coords[dim].values)
 
@@ -179,19 +276,23 @@ def _build_term(j, term, model, duration, nodes_on_edges):
             filtered_coords[dim] = valid
             print(f"      '{dim}': {valid}")
 
-        elif isinstance(spec, dict) and spec.get("filter_type") == "edge_node_role": #NOTE: this is temporary/untested
-            node = spec["node"]
-            role = spec["role"]
-            if role == "source":
-                valid = [e for e in all_coords if nodes_on_edges[e][0] == node]
-            elif role == "destination":
-                valid = [e for e in all_coords if nodes_on_edges[e][1] == node]
-            elif role == "any":
-                valid = [e for e in all_coords if node in nodes_on_edges[e]]
-            else:
-                raise ValueError(f"[target_constraints] Unknown edge role '{role}'")
-            filtered_coords[dim] = valid
-            print(f"      '{dim}' (edge_node_role node='{node}' role='{role}'): {valid}")
+        elif isinstance(spec, dict) and spec.get("filter_type") in (
+            "edge_node_role",
+            "edge_net",
+        ):
+            if edge_dim is not None:
+                raise ValueError(
+                    f"[target_constraints] Term {j} has more than one edge filter"
+                )
+            edge_dim = dim
+            edge_positive, edge_negative = _resolve_edge_role(
+                spec, all_coords, nodes_on_edges, var_name
+            )
+            print(
+                f"      '{dim}' ({spec.get('filter_type')}"
+                f"{' role=' + spec['role'] if 'role' in spec else ''}): "
+                f"+{edge_positive} -{edge_negative}"
+            )
 
         else:
             raise ValueError(
@@ -199,32 +300,32 @@ def _build_term(j, term, model, duration, nodes_on_edges):
                 f"dim '{dim}': {spec!r}"
             )
 
-    # ── STEP B: select filtered coordinates from the variable ─────────────────
-    print(f"    [STEP B] Applying .sel() filters to variable:")
-    var_filtered = var
-    for dim, coords in filtered_coords.items():
-        if not coords:
-            raise ValueError(
-                f"[target_constraints] Filter produced 0 coordinates for "
-                f"dim '{dim}' in term {j}"
+    # ── STEP B/C: select, weight by duration, sum to a scalar ─────────────────
+    def _scalar_sum(edges):
+        """Weighted scalar sum of the variable over one set of edges."""
+        selection = dict(filtered_coords)
+        if edge_dim is not None:
+            selection[edge_dim] = edges
+        var_filtered = var
+        for dim, coords in selection.items():
+            if not coords:
+                raise ValueError(
+                    f"[target_constraints] Filter produced 0 coordinates for "
+                    f"dim '{dim}' in term {j}"
+                )
+            var_filtered = var_filtered.sel({dim: coords})
+        if "set_time_steps_operation" in var_filtered.dims:
+            duration_filtered = duration.sel(
+                set_time_steps_operation=filtered_coords["set_time_steps_operation"]
             )
-        var_filtered = var_filtered.sel({dim: coords})
+            return (var_filtered * duration_filtered).sum(var_filtered.dims)
+        return var_filtered.sum()
 
-    print(f"    Filtered shape: {dict(zip(var_filtered.dims, var_filtered.shape))}")
-
-    # ── STEP C: build scalar sum, weighting time steps by duration ────────────
-    print(f"    [STEP C] Building weighted scalar sum:")
-    has_time = "set_time_steps_operation" in var_filtered.dims
-
-    if has_time:
-        time_coords = filtered_coords["set_time_steps_operation"]
-        print(f"      Time dimension present — weighting {len(time_coords)} step(s) by duration")
-        duration_filtered = duration.sel(set_time_steps_operation=time_coords)
-        expr = (var_filtered * duration_filtered).sum(var_filtered.dims)
-        print(f"      Applied duration weights vectorially over dims {list(var_filtered.dims)}")
-    else:
-        print(f"      No time dimension — direct sum over all remaining dims")
-        expr = var_filtered.sum()
+    print(f"    [STEP B/C] Building weighted scalar sum:")
+    expr = _scalar_sum(edge_positive)
+    if edge_negative:
+        print(f"      Subtracting {len(edge_negative)} opposing edge(s) → net flow")
+        expr = expr - _scalar_sum(edge_negative)
 
     print(f"    Term {j} expression ready")
     return expr
