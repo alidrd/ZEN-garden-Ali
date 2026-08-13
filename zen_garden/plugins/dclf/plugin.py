@@ -1,247 +1,629 @@
 """
-DC Load Flow (DCLF) plugin for ZEN-garden.
+DC power flow (DCPF) plugin for ZEN-garden.
 
-Adds Kirchhoff's voltage law (KVL) constraints on top of the standard
-transport model. After each optimization construction, this plugin:
-  1. Reads susceptance data from impedance.csv
-  2. Adds voltage angle variables (theta) at each node/time step
-  3. Adds flow equation constraints: P_ij = B_ij * (theta_i - theta_j)
-  4. Adds reference bus constraint: theta_slack = 0
+Adds Kirchhoff's voltage law (KVL) to a user-selected part of the network, so a
+single model can combine a physically modelled region (e.g. a detailed German
+grid) with a transport-model representation everywhere else.
+
+Formulation
+-----------
+ZEN-garden represents every physical line as two directed edges with
+non-negative flows, so KVL can be written in two ways. The plugin supports both
+and picks between them automatically, because neither is correct in all cases.
+
+**signed** — the reverse edge is pinned to zero and the forward edge is allowed
+to go negative::
+
+    F_{j,e+,t} = B_e (theta_{u,t} - theta_{v,t}),   F_{j,e-,t} = 0
+
+Flows are unique and directly interpretable. This is only valid on a *lossless,
+cost-free* line: ``flow_transport_loss`` and ``cost_opex_variable`` are both
+bounded below by zero and tied by equality to ``factor * flow_transport``, so a
+negative flow makes the model infeasible the moment a loss factor, a variable
+opex or a carbon intensity is non-zero. The plugin verifies all three are zero
+and refuses to use this mode otherwise.
+
+**net** — both directed flows stay non-negative and KVL is imposed on their
+difference::
+
+    F_{j,e+,t} - F_{j,e-,t} = B_e (theta_{u,t} - theta_{v,t})
+
+Always valid: losses, opex, emissions and both capacity constraints keep their
+stock semantics. But when losses and opex are zero the pair is determined only
+up to a common additive constant, so the solver may return large flows in both
+directions whose difference is correct. Dispatch, angles and ``|net| <= capacity``
+remain right, but per-direction flows become uninterpretable, per-direction
+capacity constraints can sit tight for purely degenerate reasons, and the
+resulting primal degeneracy makes dual values non-unique — which matters if
+nodal prices are an output. Call :func:`report_circulation` to quantify it, and
+net the directed flows before reporting anything derived from them.
+
+``flow_representation`` selects the mode: ``"auto"`` (default) uses **signed**
+where the zero-loss, zero-cost check passes and **net** elsewhere, logging which
+and why; ``"signed"`` and ``"net"`` force one, the former raising if the check
+fails. A lossless DC power flow model — the usual case — therefore gets unique,
+interpretable flows without any configuration.
+
+Scope selection
+---------------
+Impedance cannot double as the on/off switch: ``impedance`` is declared in
+``attributes.json`` with a ``default_value``, so an edge missing from
+``impedance.csv`` silently receives a valid impedance rather than a marker.
+Membership is therefore declared as a *node set*, which is also the natural way
+to express "detailed DE, transport elsewhere". An edge is KVL-constrained when
+**both** of its endpoints are in that set; boundary edges leaving the region
+stay transport edges, which is the intended behaviour.
+
+Slack buses
+-----------
+KVL fixes voltage angles only up to a constant per synchronous island, so one
+reference bus is needed per *connected component* of the KVL subgraph, not one
+globally. The components are computed from the selected lines and a slack is
+pinned in each.
+
+Configuration
+-------------
+Declared under ``plugins`` in the run config::
+
+    "plugins": {
+      "dclf": {
+        "kvl_nodes":           ["DE*"],   // names or fnmatch patterns; default all
+        "technologies":        ["power_lines"], // default: techs with impedance
+        "impedance_file":      "impedance",
+        "flow_representation": "auto",    // "auto" | "signed" | "net"
+        "slack_nodes":         [],        // optional; else one chosen per component
+        "verbose":             false
+      }
+    }
+
+Setting ``kvl_nodes`` to ``[]`` or omitting it applies KVL to the whole network,
+which reproduces a conventional DC OPF.
 """
 
+from __future__ import annotations
+
+import fnmatch
 import logging
+
 import numpy as np
+import pandas as pd
 import xarray as xr
-from zen_garden.events import Events, Event
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+
+from zen_garden.events import Event, Events
 from zen_garden.model.technology.transport_technology import TransportTechnology
 
-# Populated by loader.py from config_dclf.json
+# Populated by loader.py from the run config
 config = {}
+
+LOG_PREFIX = "DCPF plugin:"
+
+
+class DCPFDataError(ValueError):
+    """Raised when the network data cannot support the requested DCPF scope."""
+
+
+# --------------------------------------------------------------------------- #
+# Scope resolution
+# --------------------------------------------------------------------------- #
+
+
+def _resolve_kvl_nodes(patterns, nodes):
+    """Expand node name patterns into an explicit node set.
+
+    :param patterns: list of node names or fnmatch patterns; empty means all
+    :param nodes: all nodes in the system
+    :return: sorted list of selected node names
+    """
+    if not patterns:
+        return sorted(nodes)
+    selected = {n for n in nodes for p in patterns if fnmatch.fnmatch(n, p)}
+    unmatched = [p for p in patterns if not any(fnmatch.fnmatch(n, p) for n in nodes)]
+    if unmatched:
+        raise DCPFDataError(
+            f"{LOG_PREFIX} kvl_nodes patterns matched no node: {unmatched}. "
+            f"Available nodes: {sorted(nodes)}"
+        )
+    return sorted(selected)
+
+
+def _select_technologies(optimization_setup, impedance_file):
+    """Find the transport technologies that carry impedance data.
+
+    :param optimization_setup: the OptimizationSetup
+    :param impedance_file: name of the impedance input file
+    :return: list of TransportTechnology objects
+    """
+    transport_techs = optimization_setup.get_all_elements(TransportTechnology)
+    requested = config.get("technologies")
+    if requested:
+        by_name = {t.name: t for t in transport_techs}
+        missing = [n for n in requested if n not in by_name]
+        if missing:
+            raise DCPFDataError(
+                f"{LOG_PREFIX} configured technologies not found: {missing}. "
+                f"Available: {sorted(by_name)}"
+            )
+        return [by_name[n] for n in requested]
+    # auto-detect: every transport technology that declares an impedance attribute
+    return [
+        t for t in transport_techs if impedance_file in t.data_input.attribute_dict
+    ]
+
+
+def _read_susceptance(tech, impedance_file):
+    """Read impedances for one technology and invert them to susceptances.
+
+    :param tech: TransportTechnology object
+    :param impedance_file: name of the impedance input file
+    :return: pandas Series of susceptance indexed by edge
+    """
+    impedance = tech.data_input.extract_input_data(
+        file_name=impedance_file, index_sets=["set_edges"], unit_category={}
+    )
+    # extract_input_data returns a single-level MultiIndex; flatten it so that
+    # .loc[edge] yields a scalar rather than a one-element Series
+    if impedance.index.nlevels == 1 and isinstance(impedance.index, pd.MultiIndex):
+        impedance.index = impedance.index.get_level_values(0)
+    invalid = impedance[~np.isfinite(impedance) | (impedance <= 0)]
+    if len(invalid) > 0:
+        raise DCPFDataError(
+            f"{LOG_PREFIX} technology '{tech.name}' has non-positive or "
+            f"non-finite impedance on edges {sorted(invalid.index)}. "
+            f"Every edge inside the KVL region needs a positive, finite impedance."
+        )
+    return 1.0 / impedance
+
+
+def _build_lines(tech, susceptance, kvl_nodes, nodes_on_edges, valid_edges):
+    """Pair the directed edges of one technology into undirected KVL lines.
+
+    An edge qualifies when both of its endpoints are in the KVL node set. Its
+    reverse partner must exist, because the constraint is written on the net
+    flow of the pair.
+
+    :param tech: TransportTechnology object
+    :param susceptance: susceptance per edge
+    :param kvl_nodes: set of nodes inside the KVL region
+    :param nodes_on_edges: dict edge -> (node_from, node_to)
+    :param valid_edges: edges for which this technology has a flow variable
+    :return: dict of parallel lists describing the lines
+    """
+    edge_by_pair = {nodes_on_edges[e]: e for e in nodes_on_edges}
+    kvl_nodes = set(kvl_nodes)
+
+    line_ids, fwd, rev, from_nodes, to_nodes, b_values = [], [], [], [], [], []
+    missing_reverse, missing_variable = [], []
+
+    for edge, (u, v) in nodes_on_edges.items():
+        if u not in kvl_nodes or v not in kvl_nodes:
+            continue  # boundary or fully external edge -> stays a transport edge
+        if u > v:
+            continue  # handled from its canonical partner
+        reverse = edge_by_pair.get((v, u))
+        if reverse is None:
+            missing_reverse.append(edge)
+            continue
+        if edge not in valid_edges or reverse not in valid_edges:
+            missing_variable.append(edge)
+            continue
+        line_ids.append(edge)
+        fwd.append(edge)
+        rev.append(reverse)
+        from_nodes.append(u)
+        to_nodes.append(v)
+        b_values.append(float(susceptance.loc[edge]))
+
+    if missing_reverse:
+        raise DCPFDataError(
+            f"{LOG_PREFIX} technology '{tech.name}': edges {sorted(missing_reverse)} "
+            f"lie inside the KVL region but have no reverse edge. KVL is imposed on "
+            f"the net flow of a directed pair, so both directions must exist in "
+            f"set_edges.csv."
+        )
+    if missing_variable:
+        raise DCPFDataError(
+            f"{LOG_PREFIX} technology '{tech.name}': edges {sorted(missing_variable)} "
+            f"lie inside the KVL region but carry no flow variable for this "
+            f"technology. Either exclude their nodes from kvl_nodes or make the "
+            f"technology available on those edges."
+        )
+    return {
+        "line_ids": line_ids,
+        "fwd": fwd,
+        "rev": rev,
+        "from_nodes": from_nodes,
+        "to_nodes": to_nodes,
+        "b": b_values,
+    }
+
+
+def _lossless_and_free(optimization_setup, tech_name, edges):
+    """Check that a technology carries no loss, no variable opex, no emissions.
+
+    These are exactly the quantities that are tied by equality to a non-negative
+    variable times the flow, and therefore forbid a negative flow.
+
+    :param optimization_setup: the OptimizationSetup
+    :param tech_name: name of the transport technology
+    :param edges: edges to check
+    :return: (bool, list of offending parameter names)
+    """
+    parameters = optimization_setup.parameters
+    offenders = []
+    checks = {
+        "transport_loss_factor": lambda p: p.loc[tech_name, edges],
+        "opex_specific_variable": lambda p: p.loc[tech_name, edges, :],
+        "carbon_intensity_technology": lambda p: p.loc[tech_name, edges],
+    }
+    for name, selector in checks.items():
+        param = getattr(parameters, name, None)
+        if param is None:
+            continue
+        values = np.asarray(selector(param).data, dtype=float)
+        if np.any(np.abs(np.nan_to_num(values)) > 0):
+            offenders.append(name)
+    return (not offenders), offenders
+
+
+def _resolve_flow_representation(optimization_setup, tech_name, edges):
+    """Decide whether a technology uses the signed or the net formulation.
+
+    :param optimization_setup: the OptimizationSetup
+    :param tech_name: name of the transport technology
+    :param edges: the directed edges that will be KVL-constrained
+    :return: "signed" or "net"
+    """
+    requested = config.get("flow_representation", "auto")
+    if requested not in ("auto", "signed", "net"):
+        raise DCPFDataError(
+            f"{LOG_PREFIX} flow_representation must be 'auto', 'signed' or 'net', "
+            f"got '{requested}'."
+        )
+    if requested == "net":
+        return "net"
+
+    ok, offenders = _lossless_and_free(optimization_setup, tech_name, edges)
+    if requested == "signed" and not ok:
+        raise DCPFDataError(
+            f"{LOG_PREFIX} flow_representation='signed' requires a lossless, "
+            f"cost-free line, but technology '{tech_name}' has non-zero "
+            f"{offenders} on KVL edges. These are tied by equality to a "
+            f"non-negative variable times the flow, so a signed flow would make "
+            f"the model infeasible. Set them to zero or use "
+            f"flow_representation='net'."
+        )
+    if ok:
+        return "signed"
+    logging.info(
+        f"{LOG_PREFIX} technology '{tech_name}' has non-zero {offenders}; using "
+        f"the net-flow formulation. Directed flows may circulate — call "
+        f"report_circulation() after solving."
+    )
+    return "net"
+
+
+def _warn_on_bypass_paths(lines_by_tech, kvl_nodes, nodes_on_edges, node_component):
+    """Warn about controllable corridors parallel to the KVL subgraph.
+
+    An edge of another technology whose endpoints sit in the same synchronous
+    component lets flow route around the impedance constraint. That is legitimate
+    for a genuine HVDC embedded in an AC grid, and a modelling error otherwise,
+    so it is reported rather than rejected.
+
+    :param lines_by_tech: dict tech name -> line description
+    :param kvl_nodes: set of nodes inside the KVL region
+    :param nodes_on_edges: dict edge -> (node_from, node_to)
+    :param node_component: dict node -> component id
+    """
+    constrained = {e for d in lines_by_tech.values() for e in d["fwd"] + d["rev"]}
+    bypass = [
+        edge
+        for edge, (u, v) in nodes_on_edges.items()
+        if u < v
+        and u in kvl_nodes
+        and v in kvl_nodes
+        and edge not in constrained
+        and node_component.get(u) is not None
+        and node_component.get(u) == node_component.get(v)
+    ]
+    if bypass:
+        logging.warning(
+            f"{LOG_PREFIX} {len(bypass)} corridor(s) inside a synchronous component "
+            f"are not KVL-constrained and can carry flow around the impedance "
+            f"constraint: {sorted(bypass)[:10]}"
+            f"{' ...' if len(bypass) > 10 else ''}. This is correct for embedded "
+            f"HVDC and a data error otherwise."
+        )
+
+
+def _components(line_nodes_from, line_nodes_to, nodes):
+    """Find the connected components of the KVL subgraph.
+
+    :param line_nodes_from: from-node of every KVL line
+    :param line_nodes_to: to-node of every KVL line
+    :param nodes: all nodes of the system
+    :return: (dict node -> component id, number of components)
+    """
+    index = {n: i for i, n in enumerate(nodes)}
+    rows = [index[u] for u in line_nodes_from]
+    cols = [index[v] for v in line_nodes_to]
+    data = np.ones(len(rows))
+    adjacency = coo_matrix(
+        (data, (rows, cols)), shape=(len(nodes), len(nodes))
+    ).tocsr()
+    n_comp, labels = connected_components(adjacency, directed=False)
+    touched = set(line_nodes_from) | set(line_nodes_to)
+    node_component = {n: int(labels[index[n]]) for n in touched}
+    used = sorted(set(node_component.values()))
+    return node_component, used
+
+
+def _resolve_slack_nodes(node_component, used_components):
+    """Pick one reference bus per synchronous component.
+
+    :param node_component: dict node -> component id
+    :param used_components: component ids that contain at least one line
+    :return: list of slack node names
+    """
+    configured = config.get("slack_nodes") or []
+    by_component = {}
+    for node in sorted(node_component):
+        by_component.setdefault(node_component[node], []).append(node)
+
+    if configured:
+        chosen = {}
+        for node in configured:
+            if node not in node_component:
+                raise DCPFDataError(
+                    f"{LOG_PREFIX} configured slack node '{node}' is not part of any "
+                    f"KVL component. Slack nodes must lie inside the KVL region."
+                )
+            comp = node_component[node]
+            if comp in chosen:
+                raise DCPFDataError(
+                    f"{LOG_PREFIX} two slack nodes configured for the same "
+                    f"component: '{chosen[comp]}' and '{node}'."
+                )
+            chosen[comp] = node
+        missing = [c for c in used_components if c not in chosen]
+        if missing:
+            raise DCPFDataError(
+                f"{LOG_PREFIX} no slack node configured for component(s) {missing}. "
+                f"Each synchronous component needs exactly one. Candidates: "
+                f"{ {c: by_component[c][0] for c in missing} }"
+            )
+        return [chosen[c] for c in sorted(chosen)]
+
+    # default: the alphabetically first node of each component, for reproducibility
+    return [by_component[c][0] for c in used_components]
+
+
+def _set_signed_bounds(flow, tech_name, lines):
+    """Free the forward edge to go negative and remove the reverse edge.
+
+    Zero-width bounds are strictly better than an equality constraint: the
+    solver eliminates the reverse variables in presolve, so they add no rows.
+
+    :param flow: the flow_transport variable
+    :param tech_name: name of the transport technology
+    :param lines: line description produced by :func:`_build_lines`
+    """
+    for direction, edges in (("forward", lines["fwd"]), ("reverse", lines["rev"])):
+        sel = {"set_transport_technologies": tech_name, "set_edges": edges}
+        valid = flow.labels.loc[sel] != -1
+        if direction == "forward":
+            flow.lower.loc[sel] = xr.where(
+                valid, -flow.upper.loc[sel], flow.lower.loc[sel]
+            )
+        else:
+            flow.lower.loc[sel] = xr.where(valid, 0.0, flow.lower.loc[sel])
+            flow.upper.loc[sel] = xr.where(valid, 0.0, flow.upper.loc[sel])
+
+
+# --------------------------------------------------------------------------- #
+# Model construction
+# --------------------------------------------------------------------------- #
 
 
 @Events.register(Event.after_optimization_construction)
 def after_optimization_construction(optimization_setup, **kwargs):
-    """DCLF hook: fires after the optimization model is fully constructed."""
+    """Add DC power flow constraints to the constructed model.
 
-    # ------------------------------------------------------------------ #
-    # STEP 2: Read impedance from power_lines and compute susceptance
-    # ------------------------------------------------------------------ #
+    :param optimization_setup: the OptimizationSetup the plugin operates on
+    """
+    model = optimization_setup.model
+    verbose = bool(config.get("verbose", False))
+    impedance_file = config.get("impedance_file", "impedance")
 
-    transport_techs = optimization_setup.get_all_elements(TransportTechnology)
-    power_lines = next(
-        (t for t in transport_techs if t.name == "power_lines"), None
-    )
-
-    if power_lines is None:
-        logging.warning("DCLF plugin: no 'power_lines' technology found — skipping.")
+    techs = _select_technologies(optimization_setup, impedance_file)
+    if not techs:
+        logging.warning(
+            f"{LOG_PREFIX} no transport technology declares an '{impedance_file}' "
+            f"attribute — skipping."
+        )
         return
 
-    impedance = power_lines.data_input.extract_input_data(
-        file_name="impedance",
-        index_sets=["set_edges"],
-        unit_category={},
-    )
-    susceptance = 1.0 / impedance
+    if "flow_transport" not in model.variables:
+        logging.warning(f"{LOG_PREFIX} no flow_transport variable — skipping.")
+        return
 
-    # ------------------------------------------------------------------ #
-    # STEP 3: Inspect index sets and flow_transport variable
-    # ------------------------------------------------------------------ #
-
-    # Key sets we need for building DCLF constraints
-    nodes      = list(optimization_setup.sets["set_nodes"])
-    edges      = list(optimization_setup.sets["set_edges"])
-    time_steps = list(optimization_setup.sets["set_time_steps_operation"])
-
-    # Edge → (from_node, to_node) mapping, stored on energy_system
+    nodes = list(optimization_setup.sets["set_nodes"])
     nodes_on_edges = optimization_setup.energy_system.set_nodes_on_edges
+    flow = model.variables["flow_transport"]
+    valid_edges = set(np.asarray(flow.coords["set_edges"].data).tolist())
 
-    # The existing flow variable for transport technologies
-    flow_transport = optimization_setup.model.variables["flow_transport"]
+    kvl_nodes = _resolve_kvl_nodes(config.get("kvl_nodes"), nodes)
 
-    # ------------------------------------------------------------------ #
-    # STEP 3 TEST: print sets and variable info
-    # ------------------------------------------------------------------ #
-    print("\n" + "=" * 60)
-    print("DCLF plugin — Step 3: index sets & flow_transport")
-    print("=" * 60)
-    print(f"\nnodes      : {nodes}")
-    print(f"edges      : {edges}")
-    print(f"time_steps : {time_steps}")
-    print(f"\nnodes_on_edges (edge → (from, to)):")
-    for edge, (frm, to) in nodes_on_edges.items():
-        print(f"  {edge:10s} → from={frm}, to={to}")
-    print(f"\nflow_transport dims   : {flow_transport.dims}")
-    print(f"flow_transport coords : {dict(flow_transport.coords)}")
-    print("=" * 60 + "\n")
+    # ---- select and pair the lines, per technology -------------------------
+    lines_by_tech = {}
+    for tech in techs:
+        susceptance = _read_susceptance(tech, impedance_file)
+        lines = _build_lines(
+            tech, susceptance, kvl_nodes, nodes_on_edges, valid_edges
+        )
+        if lines["line_ids"]:
+            lines_by_tech[tech.name] = lines
 
-    # ------------------------------------------------------------------ #
-    # STEP 4: Add voltage angle variable theta[node, time_step]
-    # ------------------------------------------------------------------ #
-    # theta is unbounded (radians); the reference bus pin is added later.
-    # We mirror ZEN-garden's dim naming convention so linopy aligns indices
-    # consistently with the rest of the model.
+    if not lines_by_tech:
+        logging.warning(
+            f"{LOG_PREFIX} the KVL node set {kvl_nodes} contains no internal line "
+            f"— no constraints added."
+        )
+        return
 
-    model = optimization_setup.model
+    # ---- synchronous components, over the union of all KVL lines -----------
+    all_from = [u for d in lines_by_tech.values() for u in d["from_nodes"]]
+    all_to = [v for d in lines_by_tech.values() for v in d["to_nodes"]]
+    node_component, used_components = _components(all_from, all_to, nodes)
+    slack_nodes = _resolve_slack_nodes(node_component, used_components)
+    _warn_on_bypass_paths(lines_by_tech, set(kvl_nodes), nodes_on_edges, node_component)
+
+    # ---- voltage angles, only where they mean something --------------------
+    theta_nodes = sorted(node_component)
+    times = flow.coords["set_time_steps_operation"]
     theta = model.add_variables(
         lower=-np.inf,
         upper=np.inf,
-        coords=[nodes, time_steps],
+        coords=[theta_nodes, times.data],
         dims=["set_nodes", "set_time_steps_operation"],
         name="theta",
     )
 
-    # ------------------------------------------------------------------ #
-    # STEP 4 TEST: verify theta ended up in the model with correct shape
-    # ------------------------------------------------------------------ #
-    print("\n" + "=" * 60)
-    print("DCLF plugin — Step 4: theta variable")
-    print("=" * 60)
-    print(f"theta dims   : {theta.dims}")
-    print(f"theta coords : {dict(theta.coords)}")
-    print(f"theta shape  : {theta.shape}")
-    print(f"'theta' in model.variables: {'theta' in model.variables}")
-    print("=" * 60 + "\n")
-
-    # ------------------------------------------------------------------ #
-    # STEP 4b: Allow bidirectional flow on power_lines
-    # ------------------------------------------------------------------ #
-    # flow_transport is bounded below by capacity.lower = 0, making it
-    # unidirectional. DCLF requires signed flow: direction is determined
-    # by angle differences, which can be positive OR negative.
-    # Fix: set lower bound to -upper_bound for power_lines entries.
-
-    ft = optimization_setup.model.variables["flow_transport"]
-    pl_mask = ft.labels.loc["power_lines"].data != -1   # valid (non-padding) entries
-    ft.lower.loc["power_lines"].data[pl_mask] = -ft.upper.loc["power_lines"].data[pl_mask]
-
-    # ------------------------------------------------------------------ #
-    # STEP 5: Add DCLF flow equality constraints
-    # ------------------------------------------------------------------ #
-    # ZEN-garden models each physical line as TWO directed edges
-    # (e.g. AT-CH and CH-AT). Applying DCLF to both would force
-    # flow_CH-AT = -flow_AT-CH, and ZEN-garden's energy balance would
-    # count BOTH contributions, doubling the apparent power delivery.
-    #
-    # Fix: apply DCLF only to canonical edges (from_node < to_node),
-    # and pin reverse edges to zero so they don't contribute to the
-    # energy balance at all.
-
-    canonical_edges = []   # one per physical line — DCLF applied here
-    reverse_edges   = []   # paired duals — pinned to zero
-
-    for edge in edges:
-        fn, tn = nodes_on_edges[edge]
-        if fn < tn:
-            canonical_edges.append(edge)
-        else:
-            reverse_edges.append(edge)
-
-    # DCLF equality on canonical edges
-    first_edge_name = last_edge_name = None
-    first_lhs       = last_lhs       = None
-
-    for edge in canonical_edges:
-        fn, tn = nodes_on_edges[edge]
-        b = float(susceptance.loc[edge])
-
-        flow_edge  = flow_transport.loc["power_lines", edge, :]
-        theta_diff = theta.sel(set_nodes=fn) - theta.sel(set_nodes=tn)
-
-        lhs = flow_edge - b * theta_diff
-        model.add_constraints(lhs == 0, name=f"dclf_flow_{edge}")
-
-        if first_edge_name is None:
-            first_edge_name, first_lhs = edge, lhs
-        last_edge_name, last_lhs = edge, lhs
-
-    # ------------------------------------------------------------------ #
-    # STEP 5b: Reverse capacity constraint for canonical edges
-    # ------------------------------------------------------------------ #
-    # ZEN-garden's existing capacity constraint is one-sided:
-    #   max_load * capacity - flow ≥ 0   →   flow ≤ capacity
-    # This was fine when flow ≥ 0 always. With DCLF, canonical edges carry
-    # signed flow, so we also need the symmetric lower bound:
-    #   flow + max_load * capacity ≥ 0   →   flow ≥ -capacity
-    # Without this, a negative flow of -0.6 GW passes the one-sided check
-    # even if capacity_limit = 0.5 GW.
-    #
-    # Note: max_load is assumed 1.0 for power lines (standard assumption).
-    # If max_load varies per edge/time, replace `capacity_var` with
-    # `max_load * capacity_var` using the same time-step mapping below.
-
-    # Map each operational time step to its investment year
-    # (capacity is a yearly variable, flow is an operational variable)
-    ts_obj = optimization_setup.energy_system.time_steps
-    op_times_coord = flow_transport.coords["set_time_steps_operation"]
+    # ---- KVL, one vectorized constraint block per technology ---------------
+    # Indexers carry the canonical edge as the coordinate and the quantity to be
+    # selected as the value, so flows and both angles align on a common
+    # set_edges axis without any Python-level loop over edges or time steps.
     time_step_year = xr.DataArray(
-        [ts_obj.convert_time_step_operation2year(int(t)) for t in op_times_coord.data],
-        coords=[op_times_coord],
+        [
+            optimization_setup.energy_system.time_steps.convert_time_step_operation2year(
+                t
+            )
+            for t in times.data
+        ],
+        coords=[times],
     )
+    representations = {}
 
-    capacity_var = optimization_setup.model.variables["capacity"]
+    for tech_name, lines in lines_by_tech.items():
+        line_ids = lines["line_ids"]
+        coords = {"set_edges": line_ids}
 
-    for edge in canonical_edges:
-        flow_edge = flow_transport.loc["power_lines", edge, :]
+        fwd_idx = xr.DataArray(lines["fwd"], dims="set_edges", coords=coords)
+        rev_idx = xr.DataArray(lines["rev"], dims="set_edges", coords=coords)
+        from_idx = xr.DataArray(lines["from_nodes"], dims="set_edges", coords=coords)
+        to_idx = xr.DataArray(lines["to_nodes"], dims="set_edges", coords=coords)
+        susceptance = xr.DataArray(lines["b"], dims="set_edges", coords=coords)
 
-        # Select capacity for this edge at each operational time step
-        # (indexed via year mapping — mirrors ZEN-garden's term_capacity logic)
-        cap_edge = capacity_var.loc["power_lines", "power", edge, time_step_year]
+        representation = _resolve_flow_representation(
+            optimization_setup, tech_name, lines["fwd"] + lines["rev"]
+        )
+        representations[tech_name] = representation
 
-        model.add_constraints(
-            flow_edge + cap_edge >= 0,
-            name=f"dclf_rev_cap_{edge}",
+        flow_tech = flow.sel({"set_transport_technologies": tech_name})
+        angle_difference = theta.sel({"set_nodes": from_idx}) - theta.sel(
+            {"set_nodes": to_idx}
         )
 
-    # Pin reverse edges to zero via bounds — prevents double-counting in energy balance.
-    # Using bounds (lb = ub = 0) is strictly better than adding equality constraints:
-    # the solver eliminates zero-bounded variables during presolve before the LP is
-    # even handed to the simplex/interior-point method, so they add no rows to the
-    # LP matrix and no computational cost at all.
-    for edge in reverse_edges:
-        mask = ft.labels.loc["power_lines", edge].data != -1
-        ft.lower.loc["power_lines", edge].data[mask] = 0.0
-        ft.upper.loc["power_lines", edge].data[mask] = 0.0
+        if representation == "signed":
+            # The reverse edge is removed from the problem and the forward edge
+            # carries the signed flow, so the solution is unique.
+            _set_signed_bounds(flow, tech_name, lines)
+            lhs = flow_tech.sel({"set_edges": fwd_idx}) - susceptance * angle_difference
+            model.add_constraints(lhs == 0, name=f"dclf_kvl_{tech_name}")
+            # ZEN-garden's stock capacity constraint is one-sided
+            # (flow <= max_load * capacity); a signed flow needs the mirror image.
+            term_capacity = (
+                optimization_setup.parameters.max_load.loc[tech_name, line_ids, :]
+                * model.variables["capacity"].loc[
+                    tech_name, "power", line_ids, time_step_year
+                ]
+            ).rename({"set_location": "set_edges"})
+            model.add_constraints(
+                flow_tech.sel({"set_edges": fwd_idx}) + term_capacity >= 0,
+                name=f"dclf_capacity_reverse_{tech_name}",
+            )
+        else:
+            net_flow = flow_tech.sel({"set_edges": fwd_idx}) - flow_tech.sel(
+                {"set_edges": rev_idx}
+            )
+            lhs = net_flow - susceptance * angle_difference
+            model.add_constraints(lhs == 0, name=f"dclf_kvl_{tech_name}")
 
-    # ------------------------------------------------------------------ #
-    # STEP 5 TEST: verify constraints entered the model correctly
-    # ------------------------------------------------------------------ #
-    print("\n" + "=" * 60)
-    print("DCLF plugin — Step 5: DCLF flow equality constraints")
-    print("=" * 60)
-    print(f"Canonical edges (DCLF applied) : {canonical_edges}")
-    print(f"Reverse edges   (bounds→0, presolve-eliminated) : {reverse_edges}")
-    print(f"\nConstraint names in model:")
-    for name in model.constraints:
-        if name.startswith("dclf_"):
-            print(f"  {name}")
-    if first_lhs is not None:
-        print(f"\nFirst DCLF constraint — edge '{first_edge_name}' (t=0):")
-        print(f"  {first_lhs.isel(set_time_steps_operation=0)}")
-    if last_lhs is not None and last_edge_name != first_edge_name:
-        print(f"\nLast DCLF constraint  — edge '{last_edge_name}' (t=0):")
-        print(f"  {last_lhs.isel(set_time_steps_operation=0)}")
-    print("=" * 60 + "\n")
+    # ---- one reference bus per synchronous component -----------------------
+    model.add_constraints(
+        theta.sel({"set_nodes": slack_nodes}) == 0, name="dclf_reference_bus"
+    )
 
-    # ------------------------------------------------------------------ #
-    # STEP 6: Reference bus constraint — theta_slack = 0 at all time steps
-    # ------------------------------------------------------------------ #
-    # Without this, angles are only determined up to a constant offset
-    # (the LP is under-determined). Pinning one node fixes the gauge.
-    # The slack node is read from the plugin config (default: "CH").
+    n_lines = sum(len(d["line_ids"]) for d in lines_by_tech.values())
+    n_boundary = sum(
+        1
+        for edge, (u, v) in nodes_on_edges.items()
+        if u < v and (u in set(kvl_nodes)) != (v in set(kvl_nodes))
+    )
+    logging.info(
+        f"{LOG_PREFIX} KVL on {n_lines} line(s) across "
+        f"{len(lines_by_tech)} technology(ies), {len(theta_nodes)} bus(es), "
+        f"{len(used_components)} synchronous component(s); slack at {slack_nodes}; "
+        f"{n_boundary} boundary corridor(s) left as transport; "
+        f"flow representation {representations}."
+    )
+    if verbose:
+        for tech_name, lines in lines_by_tech.items():
+            logging.info(
+                f"{LOG_PREFIX} [{tech_name}] lines: "
+                f"{list(zip(lines['from_nodes'], lines['to_nodes'], strict=False))}"
+            )
+        logging.info(f"{LOG_PREFIX} components: {node_component}")
 
-    slack_node = config.get("slack_node", "CH")
-    theta_slack = theta.sel(set_nodes=slack_node)
-    model.add_constraints(theta_slack == 0, name="dclf_ref_bus")
 
-    # ------------------------------------------------------------------ #
-    # STEP 6 TEST: confirm reference bus constraint is in the model
-    # ------------------------------------------------------------------ #
-    print("\n" + "=" * 60)
-    print("DCLF plugin — Step 6: reference bus constraint")
-    print("=" * 60)
-    print(f"Slack node  : '{slack_node}'")
-    print(f"'dclf_ref_bus' in model.constraints: {'dclf_ref_bus' in model.constraints}")
-    print(f"\nExpression (t=0):")
-    print(f"  {theta_slack.isel(set_time_steps_operation=0)}")
-    print("=" * 60 + "\n")
-    logging.info("DCLF plugin: all constraints added successfully.")
+# --------------------------------------------------------------------------- #
+# Post-solve diagnostic
+# --------------------------------------------------------------------------- #
+
+
+def report_circulation(optimization_setup, tolerance=1e-6):
+    """Report directed pairs that carry flow in both directions simultaneously.
+
+    Physically only the net flow matters, so a circulating pair is harmless, but
+    it indicates that neither losses nor variable opex are penalising it. Non-zero
+    results mean reported per-direction flows should be netted before use.
+
+    Call after solving::
+
+        from zen_garden.plugins.dclf.plugin import report_circulation
+        report_circulation(optimization_setup)
+
+    :param optimization_setup: the solved OptimizationSetup
+    :param tolerance: flow below this magnitude counts as zero
+    :return: dict with the maximum and the total circulating flow
+    """
+    flow = optimization_setup.model.variables["flow_transport"].solution
+    nodes_on_edges = optimization_setup.energy_system.set_nodes_on_edges
+    edge_by_pair = {nodes_on_edges[e]: e for e in nodes_on_edges}
+
+    worst, total = 0.0, 0.0
+    for edge, (u, v) in nodes_on_edges.items():
+        reverse = edge_by_pair.get((v, u))
+        if u > v or reverse is None:
+            continue
+        if edge not in flow.coords["set_edges"] or reverse not in flow.coords[
+            "set_edges"
+        ]:
+            continue
+        pair_min = np.minimum(
+            flow.sel(set_edges=edge).data, flow.sel(set_edges=reverse).data
+        )
+        pair_min = np.where(pair_min > tolerance, pair_min, 0.0)
+        worst = max(worst, float(np.max(pair_min, initial=0.0)))
+        total += float(np.sum(pair_min))
+
+    if worst > tolerance:
+        logging.warning(
+            f"{LOG_PREFIX} circulating flow detected — max {worst:.4g}, "
+            f"total {total:.4g}. Net the directed flows before reporting."
+        )
+    else:
+        logging.info(f"{LOG_PREFIX} no circulating flow above {tolerance:g}.")
+    return {"max": worst, "total": total}
