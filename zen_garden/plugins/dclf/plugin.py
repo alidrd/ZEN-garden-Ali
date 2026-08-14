@@ -272,17 +272,31 @@ def _lossless_and_free(optimization_setup, tech_name, edges):
     """
     parameters = optimization_setup.parameters
     offenders = []
-    checks = {
-        "transport_loss_factor": lambda p: p.loc[tech_name, edges],
-        "opex_specific_variable": lambda p: p.loc[tech_name, edges, :],
-        "carbon_intensity_technology": lambda p: p.loc[tech_name, edges],
-    }
-    for name, selector in checks.items():
+    for name in (
+        "transport_loss_factor",
+        "opex_specific_variable",
+        "carbon_intensity_technology",
+    ):
         param = getattr(parameters, name, None)
         if param is None:
             continue
-        values = np.asarray(selector(param).data, dtype=float)
-        if np.any(np.abs(np.nan_to_num(values)) > 0):
+        # Reduce over any time dimension before selecting edges. Selecting first
+        # would materialise an (edges x time steps) copy of the parameter — over
+        # 100 MB at European resolution — merely to answer a yes/no question,
+        # whereas reducing a single-label view leaves one value per location.
+        by_location = param.loc[tech_name]
+        if "set_time_steps_operation" in by_location.dims:
+            extremes = (
+                by_location.max("set_time_steps_operation"),
+                by_location.min("set_time_steps_operation"),
+            )
+        else:
+            extremes = (by_location,)
+        # NaN propagates through max/min and compares False, so it counts as zero
+        if any(
+            float(extreme.loc[edges].max()) > 0 or float(extreme.loc[edges].min()) < 0
+            for extreme in extremes
+        ):
             offenders.append(name)
     return (not offenders), offenders
 
