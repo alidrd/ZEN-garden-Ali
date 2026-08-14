@@ -180,8 +180,49 @@ def _read_susceptance(tech, impedance_file):
     return 1.0 / impedance
 
 
+def _absent_edges(optimization_setup, tech_name, edges):
+    """Edges where a technology cannot exist, by its own capacity limit.
+
+    ZEN-garden creates a flow variable for every (technology, edge) combination
+    and expresses absence through capacity rather than through the index sets —
+    ``capacity_limit`` of zero is the idiom, as in
+    ``tests/testcases/test_2b``. ``capacity_limit`` is the right quantity to read
+    rather than ``capacity_existing``: an expandable corridor that has not been
+    built yet is genuinely present in the model and must keep its KVL constraint.
+
+    :param optimization_setup: the OptimizationSetup
+    :param tech_name: name of the transport technology
+    :param edges: edges to test
+    :return: set of edges where the technology has no capacity at all
+    """
+    capacity_limit = getattr(optimization_setup.parameters, "capacity_limit", None)
+    if capacity_limit is None:
+        return set()
+    limit = capacity_limit.sel(
+        {"set_technologies": tech_name, "set_capacity_types": "power"}
+    )
+    limit = limit.sel({"set_location": [e for e in edges if e in limit.coords["set_location"]]})
+    # Absent only when no year allows any capacity at all
+    largest = limit.max("set_time_steps_yearly")
+    return {
+        str(edge)
+        for edge, value in zip(
+            np.asarray(largest.coords["set_location"].data),
+            np.asarray(largest.data, dtype=float),
+            strict=True,
+        )
+        if not value > 0
+    }
+
+
 def _build_lines(
-    tech, susceptance, kvl_nodes, nodes_on_edges, valid_edges, reverse_by_edge
+    tech,
+    susceptance,
+    kvl_nodes,
+    nodes_on_edges,
+    valid_edges,
+    reverse_by_edge,
+    absent_edges,
 ):
     """Pair the directed edges of one technology into undirected KVL lines.
 
@@ -199,12 +240,13 @@ def _build_lines(
     :param nodes_on_edges: dict edge -> (node_from, node_to)
     :param valid_edges: edges for which this technology has a flow variable
     :param reverse_by_edge: dict edge -> reverse edge (or None)
+    :param absent_edges: edges where this technology has no capacity at all
     :return: dict of parallel lists describing the lines
     """
     kvl_nodes = set(kvl_nodes)
 
     line_ids, fwd, rev, from_nodes, to_nodes, b_values = [], [], [], [], [], []
-    missing_reverse, missing_variable, self_loops = [], [], []
+    missing_reverse, missing_variable, self_loops, absent = [], [], [], []
 
     for edge, (u, v) in nodes_on_edges.items():
         if u not in kvl_nodes or v not in kvl_nodes:
@@ -221,6 +263,17 @@ def _build_lines(
         if edge not in valid_edges or reverse not in valid_edges:
             missing_variable.append(edge)
             continue
+        if not absent_edges.isdisjoint((edge, reverse)):
+            # ZEN-garden builds a flow variable for every (technology, edge)
+            # pair and expresses "this technology is not here" through a zero
+            # capacity limit, so an edge belonging to another technology still
+            # reaches this loop -- and reads a defaulted impedance rather than a
+            # real one. Skipping is not merely tidier: a KVL constraint on an
+            # edge whose flow is pinned to zero would read 0 = B * dtheta and
+            # force the two buses to an identical angle, distorting every
+            # parallel path in the network.
+            absent.append(edge)
+            continue
         line_ids.append(edge)
         fwd.append(edge)
         rev.append(reverse)
@@ -232,6 +285,13 @@ def _build_lines(
         logging.warning(
             f"{LOG_PREFIX} technology '{tech.name}': ignoring {len(self_loops)} "
             f"self-loop edge(s) inside the KVL region: {sorted(self_loops)[:5]}"
+        )
+    if absent:
+        logging.info(
+            f"{LOG_PREFIX} technology '{tech.name}': {len(absent)} edge(s) inside "
+            f"the KVL region carry no capacity for it and are left to whichever "
+            f"technology owns them: {sorted(absent)[:5]}"
+            f"{' ...' if len(absent) > 5 else ''}"
         )
     if missing_reverse:
         raise DCPFDataError(
@@ -516,7 +576,13 @@ def after_optimization_construction(optimization_setup, **kwargs):
     for tech in techs:
         susceptance = _read_susceptance(tech, impedance_file)
         lines = _build_lines(
-            tech, susceptance, kvl_nodes, nodes_on_edges, valid_edges, reverse_by_edge
+            tech,
+            susceptance,
+            kvl_nodes,
+            nodes_on_edges,
+            valid_edges,
+            reverse_by_edge,
+            _absent_edges(optimization_setup, tech.name, list(nodes_on_edges)),
         )
         if lines["line_ids"]:
             lines_by_tech[tech.name] = lines
