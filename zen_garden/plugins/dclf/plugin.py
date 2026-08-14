@@ -687,3 +687,85 @@ def report_circulation(optimization_setup, tolerance=1e-6):
     else:
         logging.info(f"{LOG_PREFIX} no circulating flow above {tolerance:g}.")
     return {"max": worst, "total": total}
+
+
+def report_angle_spread(optimization_setup, threshold=0.5):
+    """Report the largest voltage angle difference across any KVL line.
+
+    DC power flow replaces ``sin(dtheta)`` with ``dtheta``, which is accurate
+    while angle differences stay small and degrades as they grow — the error is
+    about 2% at 0.3 rad and 8% at 0.7 rad. Nothing in the model enforces that,
+    because the capacity limits bound each ``dtheta = f / B`` only indirectly, so
+    a heavily loaded long corridor can quietly leave the range where the
+    linearisation is a good approximation.
+
+    This is a diagnostic, not a constraint. Imposing an angle limit would be a
+    security assumption on top of DC OPF, and it would tighten the system in a
+    way that changes prices; measuring the spread does neither.
+
+    The angles are only interpretable as radians when the exported impedances are
+    per-unit on a base matching the model's power unit. With impedances in ohms
+    the values are still proportional, so the ranking of the worst corridors
+    holds, but the threshold does not mean what it says.
+
+    Call after solving::
+
+        from zen_garden.plugins.dclf.plugin import report_angle_spread
+        report_angle_spread(optimization_setup)
+
+    :param optimization_setup: the solved OptimizationSetup
+    :param threshold: angle difference in radians above which to warn
+    :return: dict with the largest spread, where it occurs, and how many
+        (bus pair, time step) combinations exceed the threshold
+    """
+    model = optimization_setup.model
+    if "theta" not in model.variables:
+        logging.info(f"{LOG_PREFIX} no theta variable — nothing to report.")
+        return {"max": 0.0, "edge": None, "time_step": None, "exceedances": 0}
+
+    theta = model.variables["theta"].solution
+    nodes_on_edges = optimization_setup.energy_system.set_nodes_on_edges
+    angle_nodes = set(np.asarray(theta.coords["set_nodes"].data).tolist())
+
+    worst, worst_edge, worst_time, exceedances = 0.0, None, None, 0
+    seen_pairs = set()
+    for edge, (u, v) in nodes_on_edges.items():
+        if u >= v or u not in angle_nodes or v not in angle_nodes:
+            continue
+        # An angle difference belongs to a pair of buses, not to a line, so
+        # parallel corridors share one. Counting per line would make a corridor
+        # of ten circuits look ten times as strained as it is.
+        if (u, v) in seen_pairs:
+            continue
+        seen_pairs.add((u, v))
+        difference = np.abs(
+            theta.sel(set_nodes=u).data - theta.sel(set_nodes=v).data
+        )
+        exceedances += int(np.count_nonzero(difference > threshold))
+        local = float(np.max(difference, initial=0.0))
+        if local > worst:
+            worst = local
+            worst_edge = edge
+            worst_time = int(
+                theta.coords["set_time_steps_operation"].data[int(np.argmax(difference))]
+            )
+
+    if worst > threshold:
+        logging.warning(
+            f"{LOG_PREFIX} voltage angle spread reaches {worst:.3f} rad "
+            f"({np.degrees(worst):.1f} deg) on '{worst_edge}' at time step "
+            f"{worst_time}; {exceedances} (bus pair, time step) combination(s) "
+            f"exceed {threshold:g} rad. The DC linearisation is being used "
+            f"outside the range where it is a good approximation."
+        )
+    else:
+        logging.info(
+            f"{LOG_PREFIX} largest voltage angle spread {worst:.3f} rad "
+            f"({np.degrees(worst):.1f} deg), within the small-angle range."
+        )
+    return {
+        "max": worst,
+        "edge": worst_edge,
+        "time_step": worst_time,
+        "exceedances": exceedances,
+    }
