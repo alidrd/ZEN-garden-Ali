@@ -69,6 +69,10 @@ Example config entry:
 import logging
 import numpy as np
 from zen_garden.events import Events, Event
+from zen_garden.plugins.network_utils import (
+    build_reverse_edge_map,
+    describe_ambiguous_edges,
+)
 
 # Populated by loader.py from the config JSON
 config = {}
@@ -172,14 +176,6 @@ def _add_constraint(i, cstr, model, duration, nodes_on_edges):
     print(f"  ✓ '{name}' registered in model")
 
 
-def _reverse_edge_map(nodes_on_edges):
-    """Map every edge to the edge running the other way, where one exists."""
-    edge_by_pair = {nodes_on_edges[e]: e for e in nodes_on_edges}
-    return {
-        e: edge_by_pair.get((v, u)) for e, (u, v) in nodes_on_edges.items()
-    }
-
-
 def _resolve_edge_role(spec, all_coords, nodes_on_edges, var_name):
     """Resolve an edge filter into (positive edges, negative edges).
 
@@ -196,14 +192,21 @@ def _resolve_edge_role(spec, all_coords, nodes_on_edges, var_name):
                 f"[target_constraints] Edges {missing} not found in '{var_name}'. "
                 f"Available: {all_coords}"
             )
-        reverse = _reverse_edge_map(nodes_on_edges)
+        reverse, ambiguous = build_reverse_edge_map(nodes_on_edges)
         positive = list(requested)
         negative = [reverse[e] for e in requested if reverse.get(e) in all_coords]
         orphans = [e for e in requested if reverse.get(e) not in all_coords]
         if orphans:
             logging.warning(
-                f"[target_constraints] Edges {orphans} have no reverse edge; their "
-                f"flow is counted gross, not net."
+                f"[target_constraints] Edges {orphans} have no unambiguous reverse "
+                f"edge; their flow is counted gross, not net. "
+                + (
+                    describe_ambiguous_edges(
+                        ambiguous.intersection(orphans), nodes_on_edges
+                    )
+                    if ambiguous.intersection(orphans)
+                    else ""
+                )
             )
         return positive, negative
 

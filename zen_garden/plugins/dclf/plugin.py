@@ -93,6 +93,10 @@ from scipy.sparse.csgraph import connected_components
 
 from zen_garden.events import Event, Events
 from zen_garden.model.technology.transport_technology import TransportTechnology
+from zen_garden.plugins.network_utils import (
+    build_reverse_edge_map,
+    describe_ambiguous_edges,
+)
 
 # Populated by loader.py from the run config
 config = {}
@@ -176,32 +180,41 @@ def _read_susceptance(tech, impedance_file):
     return 1.0 / impedance
 
 
-def _build_lines(tech, susceptance, kvl_nodes, nodes_on_edges, valid_edges):
+def _build_lines(
+    tech, susceptance, kvl_nodes, nodes_on_edges, valid_edges, reverse_by_edge
+):
     """Pair the directed edges of one technology into undirected KVL lines.
 
     An edge qualifies when both of its endpoints are in the KVL node set. Its
     reverse partner must exist, because the constraint is written on the net
-    flow of the pair.
+    flow of the pair. Parallel corridors between the same two nodes are kept as
+    separate lines, each paired with its own reverse edge and carrying its own
+    susceptance — parallel susceptances then add up through the shared voltage
+    angles, which is what makes an aggregated corridor behave correctly without
+    a blended equivalent impedance.
 
     :param tech: TransportTechnology object
     :param susceptance: susceptance per edge
     :param kvl_nodes: set of nodes inside the KVL region
     :param nodes_on_edges: dict edge -> (node_from, node_to)
     :param valid_edges: edges for which this technology has a flow variable
+    :param reverse_by_edge: dict edge -> reverse edge (or None)
     :return: dict of parallel lists describing the lines
     """
-    edge_by_pair = {nodes_on_edges[e]: e for e in nodes_on_edges}
     kvl_nodes = set(kvl_nodes)
 
     line_ids, fwd, rev, from_nodes, to_nodes, b_values = [], [], [], [], [], []
-    missing_reverse, missing_variable = [], []
+    missing_reverse, missing_variable, self_loops = [], [], []
 
     for edge, (u, v) in nodes_on_edges.items():
         if u not in kvl_nodes or v not in kvl_nodes:
             continue  # boundary or fully external edge -> stays a transport edge
+        if u == v:
+            self_loops.append(edge)
+            continue
         if u > v:
             continue  # handled from its canonical partner
-        reverse = edge_by_pair.get((v, u))
+        reverse = reverse_by_edge.get(edge)
         if reverse is None:
             missing_reverse.append(edge)
             continue
@@ -215,12 +228,19 @@ def _build_lines(tech, susceptance, kvl_nodes, nodes_on_edges, valid_edges):
         to_nodes.append(v)
         b_values.append(float(susceptance.loc[edge]))
 
+    if self_loops:
+        logging.warning(
+            f"{LOG_PREFIX} technology '{tech.name}': ignoring {len(self_loops)} "
+            f"self-loop edge(s) inside the KVL region: {sorted(self_loops)[:5]}"
+        )
     if missing_reverse:
         raise DCPFDataError(
             f"{LOG_PREFIX} technology '{tech.name}': edges {sorted(missing_reverse)} "
-            f"lie inside the KVL region but have no reverse edge. KVL is imposed on "
-            f"the net flow of a directed pair, so both directions must exist in "
-            f"set_edges.csv."
+            f"lie inside the KVL region but have no unambiguous reverse edge. KVL is "
+            f"imposed on the net flow of a directed pair, so each edge needs exactly "
+            f"one partner. Add the missing reverse edge to set_edges.csv, or give "
+            f"parallel corridors distinct '<from>-<to>__<asset>' ids so they can be "
+            f"told apart."
         )
     if missing_variable:
         raise DCPFDataError(
@@ -456,12 +476,33 @@ def after_optimization_construction(optimization_setup, **kwargs):
 
     kvl_nodes = _resolve_kvl_nodes(config.get("kvl_nodes"), nodes)
 
+    # ---- pair directed edges once, and refuse to guess ---------------------
+    reverse_by_edge, ambiguous_edges = build_reverse_edge_map(nodes_on_edges)
+    ambiguous_in_region = {
+        e
+        for e in ambiguous_edges
+        if nodes_on_edges[e][0] in set(kvl_nodes)
+        and nodes_on_edges[e][1] in set(kvl_nodes)
+    }
+    if ambiguous_in_region:
+        raise DCPFDataError(
+            f"{LOG_PREFIX} cannot pair directed edges inside the KVL region. "
+            f"{describe_ambiguous_edges(ambiguous_in_region, nodes_on_edges)}. "
+            f"Pairing on the node pair alone would attach every parallel corridor "
+            f"to the same reverse edge and leave the rest unconstrained."
+        )
+    if ambiguous_edges - ambiguous_in_region:
+        logging.info(
+            f"{LOG_PREFIX} {len(ambiguous_edges - ambiguous_in_region)} ambiguous "
+            f"edge pair(s) outside the KVL region — not constrained, so harmless here."
+        )
+
     # ---- select and pair the lines, per technology -------------------------
     lines_by_tech = {}
     for tech in techs:
         susceptance = _read_susceptance(tech, impedance_file)
         lines = _build_lines(
-            tech, susceptance, kvl_nodes, nodes_on_edges, valid_edges
+            tech, susceptance, kvl_nodes, nodes_on_edges, valid_edges, reverse_by_edge
         )
         if lines["line_ids"]:
             lines_by_tech[tech.name] = lines
@@ -601,12 +642,17 @@ def report_circulation(optimization_setup, tolerance=1e-6):
     """
     flow = optimization_setup.model.variables["flow_transport"].solution
     nodes_on_edges = optimization_setup.energy_system.set_nodes_on_edges
-    edge_by_pair = {nodes_on_edges[e]: e for e in nodes_on_edges}
+    reverse_by_edge, ambiguous_edges = build_reverse_edge_map(nodes_on_edges)
+    if ambiguous_edges:
+        logging.warning(
+            f"{LOG_PREFIX} skipping ambiguous edges in the circulation check. "
+            f"{describe_ambiguous_edges(ambiguous_edges, nodes_on_edges)}"
+        )
 
     worst, total = 0.0, 0.0
     for edge, (u, v) in nodes_on_edges.items():
-        reverse = edge_by_pair.get((v, u))
-        if u > v or reverse is None:
+        reverse = reverse_by_edge.get(edge)
+        if u >= v or reverse is None:
             continue
         if edge not in flow.coords["set_edges"] or reverse not in flow.coords[
             "set_edges"
