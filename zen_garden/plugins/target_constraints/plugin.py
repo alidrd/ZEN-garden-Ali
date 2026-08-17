@@ -22,6 +22,44 @@ Dimension filter spec for each dim:
     "edges": ["DE-CH", ...]        // each minus its reverse edge
   }
 
+Energy targets and power limits
+-------------------------------
+By default a constraint is summed over the whole horizon and weighted by time
+step duration, giving an energy target in GWh: "annual exports from DE >= X TWh".
+
+Setting ``"as_power_limit": true`` changes the shape rather than the filters. The
+duration weighting is dropped and the time dimension is kept, so one constant
+right-hand side -- read as a *power* in GW -- applies in every time step. Note this
+does not make the limit time-varying: it makes a single constant limit hold
+continuously, which is what a transfer capacity is and the only form in which an
+NTC can be expressed:
+
+  {
+    "comment": "DE -> CH net transfer <= 4 GW in every hour",
+    "as_power_limit": true,
+    "terms": [{
+      "variable": "flow_transport",
+      "dimensions": {
+        "set_transport_technologies": ["power_lines"],
+        "set_edges": {"filter_type": "edge_net", "edges": ["<the DE->CH corridors>"]},
+        "set_time_steps_operation": "all"
+      }
+    }],
+    "sense": "<=", "rhs": 4.0, "unit": "GW"
+  }
+
+Two of these give a directional NTC: one "<=" for the export direction and one
+">=" with a negative right-hand side for the import direction. Applied on top of
+Kirchhoff's voltage law they act as a security overlay -- the impedances still
+decide how flow divides between parallel corridors, while the limit caps the
+total in a way the physical line ratings alone do not. Omit them and the binding
+cross-border constraint is the summed thermal rating of the circuits, which is
+far above any published transfer capacity.
+
+Units are checked against the shape: an energy target must use Wh/MWh/GWh/TWh, a
+power limit must use W/MW/GW/TW. Mixing them would be wrong by the number of hours
+in the horizon, so it is rejected rather than converted.
+
 Directed vs net flows
 ---------------------
 ZEN-garden represents every corridor as two directed edges with non-negative
@@ -85,6 +123,14 @@ _UNIT_TO_GWH = {
     "TWh": 1_000.0,
 }
 
+# Power → GW conversion, for power limits (model internal power unit is GW)
+_UNIT_TO_GW = {
+    "W":   1e-9,
+    "MW":  1e-3,
+    "GW":  1.0,
+    "TW":  1_000.0,
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Event hook
@@ -140,18 +186,41 @@ def _add_constraint(i, cstr, model, duration, nodes_on_edges):
     comment  = cstr.get("comment", f"constraint_{i}")
     name_constraint = cstr.get("name", f"target_constraint_{i}")
     sense    = cstr["sense"]
-    unit     = cstr.get("unit", "GWh")
     rhs_user = float(cstr["rhs"])
-    rhs_gwh  = rhs_user * _UNIT_TO_GWH.get(unit, 1.0)
+    as_power_limit = bool(cstr.get("as_power_limit", False))
+
+    # An energy target is a single number in GWh; a power limit such as a transfer
+    # capacity is a rate in GW that applies in every time step. The two use
+    # different unit tables, and mixing them silently would be off by the number
+    # of hours in the horizon.
+    if as_power_limit:
+        unit = cstr.get("unit", "GW")
+        if unit not in _UNIT_TO_GW:
+            raise ValueError(
+                f"[target_constraints] Constraint {i} is a power limit, so its "
+                f"unit must be a power unit {sorted(_UNIT_TO_GW)}, got {unit!r}."
+            )
+        rhs_internal = rhs_user * _UNIT_TO_GW[unit]
+        internal_unit = "GW"
+    else:
+        unit = cstr.get("unit", "GWh")
+        if unit not in _UNIT_TO_GWH:
+            raise ValueError(
+                f"[target_constraints] Constraint {i} is an energy target, so its "
+                f"unit must be an energy unit {sorted(_UNIT_TO_GWH)}, got {unit!r}."
+            )
+        rhs_internal = rhs_user * _UNIT_TO_GWH[unit]
+        internal_unit = "GWh"
 
     print(f"\n[CONSTRAINT {i}] {comment}")
+    print(f"  Kind  : {'power limit, applied per time step' if as_power_limit else 'energy target, summed over the horizon'}")
     print(f"  Sense : {sense}")
-    print(f"  RHS   : {rhs_user} {unit}  →  {rhs_gwh} GWh")
+    print(f"  RHS   : {rhs_user} {unit}  →  {rhs_internal} {internal_unit}")
 
     # Build scalar expression by summing all terms
     total_expr = None
     for j, term in enumerate(cstr["terms"]):
-        expr = _build_term(j, term, model, duration, nodes_on_edges)
+        expr = _build_term(j, term, model, duration, nodes_on_edges, as_power_limit)
         total_expr = expr if total_expr is None else (total_expr + expr)
     
     print(f"\n  Created expression is: {total_expr}")
@@ -164,11 +233,11 @@ def _add_constraint(i, cstr, model, duration, nodes_on_edges):
         raise ValueError(f"[target_constraints] Constraint name '{name}' already exists in model")
     
     if sense == "<=":
-        model.add_constraints(total_expr <= rhs_gwh, name=name)
+        model.add_constraints(total_expr <= rhs_internal, name=name)
     elif sense == ">=":
-        model.add_constraints(total_expr >= rhs_gwh, name=name)
+        model.add_constraints(total_expr >= rhs_internal, name=name)
     elif sense == "==":
-        model.add_constraints(total_expr == rhs_gwh, name=name)
+        model.add_constraints(total_expr == rhs_internal, name=name)
     else:
         raise ValueError(f"[target_constraints] Unknown sense '{sense}'")
 
@@ -238,7 +307,7 @@ def _resolve_edge_role(spec, all_coords, nodes_on_edges, var_name):
     raise ValueError(f"[target_constraints] Unknown edge role '{role}'")
 
 
-def _build_term(j, term, model, duration, nodes_on_edges):
+def _build_term(j, term, model, duration, nodes_on_edges, as_power_limit=False):
     """
     Build a scalar linopy LinearExpression for one term:
       Σ_{filtered dims} variable * duration_weight
@@ -303,9 +372,15 @@ def _build_term(j, term, model, duration, nodes_on_edges):
                 f"dim '{dim}': {spec!r}"
             )
 
-    # ── STEP B/C: select, weight by duration, sum to a scalar ─────────────────
-    def _scalar_sum(edges):
-        """Weighted scalar sum of the variable over one set of edges."""
+    # ── STEP B/C: select, then sum ────────────────────────────────────────────
+    def _sum(edges):
+        """Sum the variable over one set of edges.
+
+        Two shapes, chosen by ``as_power_limit``. Summed over time the result is a
+        single energy quantity in GWh. Kept per time step it is a power in GW that
+        the constraint applies in every step -- a constant limit holding
+        continuously, which is what a transfer limit such as an NTC is.
+        """
         selection = dict(filtered_coords)
         if edge_dim is not None:
             selection[edge_dim] = edges
@@ -317,18 +392,33 @@ def _build_term(j, term, model, duration, nodes_on_edges):
                     f"dim '{dim}' in term {j}"
                 )
             var_filtered = var_filtered.sel({dim: coords})
-        if "set_time_steps_operation" in var_filtered.dims:
+
+        has_time = "set_time_steps_operation" in var_filtered.dims
+        if as_power_limit:
+            # A power limit: never weight by duration, and never collapse time.
+            # Summing the other dimensions leaves one expression per time step.
+            other = [d for d in var_filtered.dims if d != "set_time_steps_operation"]
+            return var_filtered.sum(other) if other else var_filtered
+        if has_time:
             duration_filtered = duration.sel(
                 set_time_steps_operation=filtered_coords["set_time_steps_operation"]
             )
             return (var_filtered * duration_filtered).sum(var_filtered.dims)
         return var_filtered.sum()
 
-    print(f"    [STEP B/C] Building weighted scalar sum:")
-    expr = _scalar_sum(edge_positive)
+    if as_power_limit:
+        if "set_time_steps_operation" not in var.dims:
+            raise ValueError(
+                f"[target_constraints] Term {j}: as_power_limit was requested but "
+                f"'{var_name}' has no time dimension."
+            )
+        print(f"    [STEP B/C] Building per-time-step sum (a power limit):")
+    else:
+        print(f"    [STEP B/C] Building weighted scalar sum (an energy limit):")
+    expr = _sum(edge_positive)
     if edge_negative:
         print(f"      Subtracting {len(edge_negative)} opposing edge(s) → net flow")
-        expr = expr - _scalar_sum(edge_negative)
+        expr = expr - _sum(edge_negative)
 
     print(f"    Term {j} expression ready")
     return expr
