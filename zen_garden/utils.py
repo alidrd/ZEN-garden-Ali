@@ -33,7 +33,7 @@ def setup_logger(level=logging.INFO):
     logging.basicConfig(
         stream=sys.stdout,
         level=level,
-        format="%(message)s",
+        format="%(asctime)s [+%(relativeCreated)8.0f ms] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logging.captureWarnings(True)
