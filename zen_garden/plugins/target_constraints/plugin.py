@@ -115,6 +115,10 @@ from zen_garden.plugins.network_utils import (
 # Populated by loader.py from the config JSON
 config = {}
 
+# Toggled by loader.py; the hook is process-global once imported, so runs that
+# do not select this plugin must not execute it.
+enabled = False
+
 # Unit → GWh conversion (model internal energy unit is GWh)
 _UNIT_TO_GWH = {
     "Wh":  1e-9,
@@ -140,6 +144,8 @@ _UNIT_TO_GW = {
 def after_optimization_construction(optimization_setup, **kwargs):
     """Fires after the full linopy model is built. Adds target constraints."""
 
+    if not enabled:
+        return
     constraints_cfg = config.get("target_constraints", [])
     if not constraints_cfg:
         logging.info("[target_constraints] No constraints defined — skipping.")

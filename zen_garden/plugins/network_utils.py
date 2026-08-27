@@ -22,8 +22,12 @@ ambiguous pair is reported rather than resolved arbitrarily.
 ASSET_SEPARATOR = "__"
 
 
-def _pair_key(edge, node_from, node_to):
+def pair_key(edge, node_from, node_to):
     """Build the identity of a directed edge for partner lookup.
+
+    Passing the node pair in a canonical order (e.g. ``min(u, v), max(u, v)``)
+    turns this into an orientation-independent *corridor* key, which is how
+    the DCPF plugin deduplicates the two directions of a corridor.
 
     :param edge: edge id
     :param node_from: origin node
@@ -34,6 +38,11 @@ def _pair_key(edge, node_from, node_to):
         edge.split(ASSET_SEPARATOR, 1)[1] if ASSET_SEPARATOR in edge else None
     )
     return node_from, node_to, asset
+
+
+# Backward-compatible alias: pair_key started module-private and was promoted
+# so plugins can reuse it instead of re-implementing the asset-suffix split.
+_pair_key = pair_key
 
 
 def build_reverse_edge_map(nodes_on_edges):
